@@ -83,6 +83,10 @@ typedef struct {
 
 typedef struct {
 	mergedata *data;
+    char *prefix_props;
+    int prefix_props_size;
+    char *suffix_props;
+    int suffix_props_size;
 	int revision;
 	int node;
 	int orig_size;
@@ -845,34 +849,65 @@ mergedata* add_mergedata(char *minfo, int *size) {
 	return md;
 }
 
-mergeinfo* create_mergeinfo(mergeinfo *mi, char *minfo, int rev, int nod, int *mi_len) {
+mergeinfo* create_mergeinfo(mergeinfo *mi, char *minfo, int minfo_len, int rev, int nod, int *mi_len) {
 	int orig;
 	int i = 0;
-	// Parse past newlines turned NULL, and "K 13" line...
-	while (minfo[i] == '\0' || minfo[i] == 'K' || minfo[i] == ' ' || minfo[i] == '1' || minfo[i] == '3') {
-		++i;
-	}
-	// Mismatch here means it's not a mergeinfo. Abort.
-	if (strcmp(&minfo[i], "svn:mergeinfo") != 0) {
-		return mi;
-	}
-	i += 14; // 13 chars + NULL
-	// Empty value == Abort. Why does svn even add this kind of manure to the dump file?
-	if (strcmp(&minfo[i], "V 0") == 0) {
-		return mi;
-	}
-	// Otherwise go past the "V (whatever)" line...
-	while (minfo[i] != '\0') {
-		++i;
-	}
-	++i;
+    int j = 0;
+    char* found_pos = NULL;
+    int prefix_props_size = 0;
+    int suffix_props_size = 0;
+    int suffix_props_pos = 0;
+    int mergeinfo_data_len = 0;
+    if ((found_pos = strstr(minfo, "K 13\nsvn:mergeinfo\n")) == NULL) {
+        return mi;
+    }
+    prefix_props_size = (int)(found_pos - minfo);
+
+    i = prefix_props_size + 19 + 2; // 19 = "K 13\nsvn:mergeinfo\n"  2 = "V "
+
+    mergeinfo_data_len = atoi(&minfo[i]);
+
+    if (mergeinfo_data_len == 0)
+        return mi;
+
+    // Move over the mergeinfo data length info to next line
+    while (minfo[i] != NEWLINE && i < minfo_len)
+        ++i;
+
+    ++i;
+
+    // Modify new lines to nulls just for the add_mergedata function (mergeinfo_data_len does not include last linefeed)
+    for (j = 0 ; j < mergeinfo_data_len + 1 ; ++j)
+        if (minfo[i + j] == NEWLINE)
+            minfo[i +j] = '\0';
+
+    suffix_props_pos = i + mergeinfo_data_len + 1; // skip linefeed after mergeinfo data
+    suffix_props_size = minfo_len - suffix_props_pos - 1; // there is an extra linefeed we can remove here
+
 	if ((mi = (mergeinfo*)realloc(mi, (*mi_len + 1) * sizeof(mergeinfo))) == NULL) {
 		exit_with_error("realloc failed", 2);
 	}
+    
+    mi[*mi_len].prefix_props_size = prefix_props_size;
+    mi[*mi_len].prefix_props = malloc(prefix_props_size);
+    
+    if (mi[*mi_len].prefix_props == NULL)
+		exit_with_error("malloc failed", 2);
+    
+    memcpy(mi[*mi_len].prefix_props, minfo, prefix_props_size);
+    
+    mi[*mi_len].suffix_props_size = suffix_props_size;
+    mi[*mi_len].suffix_props = malloc(suffix_props_size);
+    
+    if (mi[*mi_len].suffix_props == NULL)
+		exit_with_error("malloc failed", 2);
+    
+    memcpy(mi[*mi_len].suffix_props, &minfo[suffix_props_pos], suffix_props_size);
+
 	mi[*mi_len].data = add_mergedata(&minfo[i], &orig);
 	mi[*mi_len].revision = rev;
 	mi[*mi_len].node = nod;
-	mi[*mi_len].orig_size = i + orig + 9; // "PROPS-END"
+	mi[*mi_len].orig_size = i + orig + suffix_props_size;
 	++*mi_len;
 	return mi;
 }
@@ -901,10 +936,11 @@ int get_mergerow_size(mergedata *data, revision *revisions, char *redefined_root
 	return size;
 }
 
-void write_mergeinfo(FILE *outfile, mergedata *data, revision *revisions, char *redefined_root, int orig_size, off_t con_len, off_t pcon_len) {
+void write_mergeinfo(FILE *outfile, mergeinfo *mi, int act_mi, revision *revisions, char *redefined_root, int orig_size, off_t con_len, off_t pcon_len) {
 	int i, v_size, diff, to, from;
 	int size = 0;
 	char *temp;
+    mergedata *data = mi[act_mi].data;
 	for (i = 0; i < data->size; ++i) {
 		size += get_mergerow_size(data, revisions, redefined_root, i);
 	}
@@ -912,8 +948,11 @@ void write_mergeinfo(FILE *outfile, mergedata *data, revision *revisions, char *
 	size += num_len(v_size) + 3; // "V XXX\n"
 	size += 30; // "\nK 13\nsvn:mergeinfo\n"  ... "\nPROPS-END"
 	diff = orig_size - size;
-	fprintf(outfile, "Prop-content-length: %d\nContent-length: %d\n\nK 13\nsvn:mergeinfo\nV %d\n",
-					(int)pcon_len - diff, (int)con_len - diff, v_size);
+	fprintf(outfile, "Prop-content-length: %d\nContent-length: %d\n",
+					(int)pcon_len - diff, (int)con_len - diff);
+    fwrite(mi[act_mi].prefix_props, 1, mi[act_mi].prefix_props_size, outfile);
+	fprintf(outfile, "K 13\nsvn:mergeinfo\nV %d\n",
+					v_size);
 	for (i = 0; i < data->size; ++i) {
 		to = get_new_revision_number(revisions, data->to[i]);
 		from = get_new_revision_number(revisions, data->from[i]);
@@ -933,6 +972,7 @@ void write_mergeinfo(FILE *outfile, mergedata *data, revision *revisions, char *
 			free(temp);
 		}
 	}
+    fwrite(mi[act_mi].suffix_props, 1, mi[act_mi].suffix_props_size, outfile);
 }
 
 /*******************************************************************************
@@ -1186,17 +1226,11 @@ int main(int argc, char **argv) {
 						minfo = str_malloc(offset + 1);
 						i = 0;
 						while ((ch = fgetc(infile)) != EOF && i < offset) {
-							// NULL instead of newline means needed string operations are easier later.
-							if (ch == NEWLINE) {
-								minfo[i] = '\0';
-							}
-							else {
-								minfo[i] = ch;
-							}
+                            minfo[i] = ch;
 							++i;
 						}
 						minfo[i] = '\0';
-						mi = create_mergeinfo(mi, minfo, rev_len, nod_len, &mi_len);
+						mi = create_mergeinfo(mi, minfo, i, rev_len, nod_len, &mi_len);
 						free(minfo);
 					}
 					else {
@@ -1627,7 +1661,7 @@ int main(int argc, char **argv) {
 					con_len = (off_t)atol(&current_line[16]);
 					if (writing) {
 						if (pcon_len) {
-							write_mergeinfo(outfile, mi[act_mi].data, revisions, redefined_root, mi[act_mi].orig_size, con_len, pcon_len);
+							write_mergeinfo(outfile, mi, act_mi, revisions, redefined_root, mi[act_mi].orig_size, con_len, pcon_len);
 							// -10 is because of the "PROPS-END\n" that is included in orig_size.
 							fseeko(infile, mi[act_mi].orig_size - 10, SEEK_CUR);
 							while (fgetc(infile) != NEWLINE) {}
@@ -1828,6 +1862,8 @@ int main(int argc, char **argv) {
 		free(mi[i].data->from);
 		free(mi[i].data->to);
 		free(mi[i].data);
+        free(mi[i].prefix_props);
+        free(mi[i].suffix_props);
 	}
 	free(mi);
 	for (i = 0; i < inc_len; ++i) {
